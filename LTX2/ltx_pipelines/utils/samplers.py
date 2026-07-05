@@ -16,6 +16,11 @@ from .types import Denoiser, LatentState
 
 logger = logging.getLogger(__name__)
 
+try:
+    from comfy.utils import ProgressBar
+except ImportError:
+    ProgressBar = None
+
 
 def _step_state(
     state: LatentState | None,
@@ -67,11 +72,14 @@ def euler_denoising_loop(
     tuple[LatentState | None, LatentState | None]
         Final ``(video_state, audio_state)`` after the denoising loop.
     """
+    pbar = ProgressBar(len(sigmas) - 1) if ProgressBar is not None else None
     for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
         denoised_video, denoised_audio = denoiser(transformer, video_state, audio_state, sigmas, step_idx,gpu_manager)
 
         video_state = _step_state(video_state, denoised_video, stepper, sigmas, step_idx)
         audio_state = _step_state(audio_state, denoised_audio, stepper, sigmas, step_idx)
+        if pbar is not None:
+            pbar.update(1)
 
     return (video_state, audio_state)
 
@@ -111,6 +119,7 @@ def gradient_estimating_euler_denoising_loop(
             denoised_sample = to_denoised(noisy_sample, total_velocity, sigma)
         return current_velocity, denoised_sample
 
+    pbar = ProgressBar(len(sigmas) - 1) if ProgressBar is not None else None
     for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
         denoised_video, denoised_audio = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
 
@@ -118,6 +127,9 @@ def gradient_estimating_euler_denoising_loop(
             denoised_video = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
         if audio_state is not None and denoised_audio is not None:
             denoised_audio = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
+
+        if pbar is not None:
+            pbar.update_absolute(step_idx + 1)
 
         if sigmas[step_idx + 1] == 0:
             if video_state is not None and denoised_video is not None:
@@ -269,6 +281,7 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
     phi_cache = {}
     c2 = 0.5  # Midpoint for res_2s
 
+    pbar = ProgressBar(n_full_steps) if ProgressBar is not None else None
     for step_idx in tqdm(range(n_full_steps)):
         sigma = sigmas[step_idx].double()
         sigma_next = sigmas[step_idx + 1].double()
@@ -409,6 +422,9 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
             video_state = replace(video_state, latent=x_next_video.to(model_dtype))
         if audio_state is not None and x_next_audio is not None:
             audio_state = replace(audio_state, latent=x_next_audio.to(model_dtype))
+
+        if pbar is not None:
+            pbar.update_absolute(step_idx + 1)
 
     # Final step if we need to fully remove the noise
     if sigmas[-1] == 0:

@@ -166,26 +166,10 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
                 #match_state_dict(meta_model, sd,show_num=10)
             elif self.load_model == "prompt_encoder"and first_shard_path.endswith(".gguf") :
                 def adjust_key_name(key):
-                    from packaging import version
-                    import transformers
-                    transformers_version = version.parse(transformers.__version__)
-                    required_version = version.parse('4.57.0')
-                    if "vision_model.embeddings.position_ids" in key or "language_model.embed_tokens.embed_scale" in key:
-                        print(key)
-                    if transformers_version >= required_version:
-                        if "language_model.model." in key:
-                            return 'model.model.language_model.' + key[len('language_model.model.'):]
-                        else:
-                            return 'model.model.' + key
+                    if "language_model.model." in key:
+                        return 'model.model.language_model.' + key[len('language_model.model.'):]
                     else:
-                        if key.startswith('language_model.model.') :
-                            return 'model.language_model.' + key[len('language_model.model.'):]
-                        elif key.startswith('vision_tower.'):
-                            return 'model.' + key
-                        elif key.startswith('multi_modal_projector.'):
-                            return 'model.' + key
-                        else:
-                            return key
+                        return 'model.model.' + key
                 #match_state_dict(meta_model, model_state_dict,50)    
                 adjusted_state_dict = {}
                 for key, value in model_state_dict.items():
