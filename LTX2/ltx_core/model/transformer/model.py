@@ -597,7 +597,13 @@ class BlockGPUManager:
                 for layer in self._original_block_ref[start_idx:end_idx]:
                     pinned = {}
                     for name, tensor in itertools.chain(layer.named_parameters(), layer.named_buffers()):
-                        pinned[name] = tensor.data.pin_memory()
+                        # Replace the original (unpinned) buffer in-place instead of
+                        # keeping both around: pin_memory() returns a copy, so without
+                        # reassigning tensor.data the old unpinned buffer stays alive
+                        # via _original_block_ref for the whole generation, doubling
+                        # this model's CPU RAM footprint for no reason.
+                        tensor.data = tensor.data.pin_memory()
+                        pinned[name] = tensor.data
                     group_pins.append(pinned)
                 self._pinned_groups[group_index] = group_pins
         else:
