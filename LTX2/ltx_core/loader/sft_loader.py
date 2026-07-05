@@ -35,7 +35,7 @@ class SafetensorsStateDictLoader(StateDictLoader):
         device = device or torch.device("cpu")
         model_paths = path if isinstance(path, list) else [path]
         for shard_path in model_paths:
-            with safetensors.safe_open(shard_path, framework="pt", device=str(device)) as f:
+            with safetensors.safe_open(shard_path, framework="pt", device="cpu") as f:
                 safetensor_keys = f.keys()
                 for name in safetensor_keys:
                     expected_name = name if sd_ops is None else sd_ops.apply_to_key(name)

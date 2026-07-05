@@ -7,6 +7,7 @@ from .rope import LTXRopeType, apply_rotary_emb
 
 memory_efficient_attention = None
 flash_attn_interface = None
+sageattn = None
 try:
     from xformers.ops import memory_efficient_attention
 except ImportError:
@@ -17,6 +18,10 @@ try:
         import flash_attn_interface
 except ImportError:
     flash_attn_interface = None
+try:
+    from sageattention import sageattn
+except ImportError:
+    sageattn = None
 
 
 class AttentionCallable(Protocol):
@@ -116,10 +121,46 @@ class FlashAttention3(AttentionCallable):
         return out
 
 
+class SageAttention(AttentionCallable):
+    """Uses SageAttention's quantized kernel for the common mask=None case.
+    SageAttention only supports an ``is_causal`` bool, not arbitrary attention
+    masks, so masked calls (e.g. cross-attention with padding) transparently
+    fall back to PyTorch SDPA instead of raising.
+    """
+
+    def __init__(self) -> None:
+        self._fallback = PytorchAttention()
+
+    def __call__(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        heads: int,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if sageattn is None:
+            raise RuntimeError("SageAttention was selected but `sageattention` is not installed.")
+
+        if mask is not None:
+            return self._fallback(q, k, v, heads, mask)
+
+        b, _, dim_head = q.shape
+        dim_head //= heads
+
+        # sageattn expects [B, M, H, K] with tensor_layout="NHD"
+        q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
+
+        out = sageattn(q.to(v.dtype), k.to(v.dtype), v, tensor_layout="NHD", is_causal=False)
+        out = out.reshape(b, -1, heads * dim_head)
+        return out
+
+
 class AttentionFunction(Enum):
     PYTORCH = "pytorch"
     XFORMERS = "xformers"
     FLASH_ATTENTION_3 = "flash_attention_3"
+    SAGE = "sage"
     DEFAULT = "default"
 
     def to_callable(self) -> AttentionCallable:
@@ -131,8 +172,12 @@ class AttentionFunction(Enum):
             return XFormersAttention()
         elif self is AttentionFunction.FLASH_ATTENTION_3:
             return FlashAttention3()
+        elif self is AttentionFunction.SAGE:
+            return SageAttention()
         else:
-            # Default behavior: XFormers if installed else - PyTorch
+            # Default behavior: Sage > XFormers > PyTorch, in order of availability
+            if sageattn is not None:
+                return SageAttention()
             return XFormersAttention() if memory_efficient_attention is not None else PytorchAttention()
 
 
