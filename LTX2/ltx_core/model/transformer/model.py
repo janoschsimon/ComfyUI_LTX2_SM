@@ -587,6 +587,7 @@ class BlockGPUManager:
         # Pin each group's CPU weights once so later H2D copies can be async.
         # Skipped for the non-GGUF (deepcopy) path and when CUDA isn't available.
         if self.use_gguf and torch.cuda.is_available():
+            print("[LTX2] Async block-swap prefetch: enabled (pinned memory + side CUDA stream)")
             self._prefetch_stream = torch.cuda.Stream(device=self.device)
             self._pinned_groups = [None] * self._num_groups
             for group_index in range(self._num_groups):
@@ -599,6 +600,8 @@ class BlockGPUManager:
                         pinned[name] = tensor.data.pin_memory()
                     group_pins.append(pinned)
                 self._pinned_groups[group_index] = group_pins
+        else:
+            print("[LTX2] Async block-swap prefetch: disabled (non-GGUF path or no CUDA), using synchronous transfers")
 
     def _load_group(self, group_index, non_blocking=False):
         """加载指定组的数据块"""

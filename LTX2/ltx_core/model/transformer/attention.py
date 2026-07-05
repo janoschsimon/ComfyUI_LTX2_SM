@@ -23,6 +23,13 @@ try:
 except ImportError:
     sageattn = None
 
+print(
+    f"[LTX2] Attention backends available: "
+    f"Sage={sageattn is not None} XFormers={memory_efficient_attention is not None} "
+    f"Flash3={flash_attn_interface is not None}"
+)
+_default_backend_logged = False
+
 
 class AttentionCallable(Protocol):
     def __call__(
@@ -176,9 +183,17 @@ class AttentionFunction(Enum):
             return SageAttention()
         else:
             # Default behavior: Sage > XFormers > PyTorch, in order of availability
+            global _default_backend_logged
             if sageattn is not None:
-                return SageAttention()
-            return XFormersAttention() if memory_efficient_attention is not None else PytorchAttention()
+                chosen = SageAttention()
+            elif memory_efficient_attention is not None:
+                chosen = XFormersAttention()
+            else:
+                chosen = PytorchAttention()
+            if not _default_backend_logged:
+                print(f"[LTX2] DEFAULT attention backend resolved to: {type(chosen).__name__}")
+                _default_backend_logged = True
+            return chosen
 
 
 class Attention(torch.nn.Module):
