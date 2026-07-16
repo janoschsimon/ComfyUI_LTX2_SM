@@ -485,7 +485,7 @@ def load_gguf_checkpoint(gguf_checkpoint_path, sd_ops=None, return_tensors=False
                 )
             )
 
-        weights = torch.from_numpy(tensor.data) #tensor.data.copy()
+        weights = torch.from_numpy(tensor.data.copy())
         if sd_ops is not None:
             if is_simple_replacement:
                 if replacement_from in name:

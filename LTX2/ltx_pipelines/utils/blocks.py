@@ -6,6 +6,7 @@ removes the need for :class:`ModelLedger`.
 
 from __future__ import annotations
 
+import gc
 import logging
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -393,7 +394,26 @@ class DiffusionStage:
             audio_state = audio_tools.clear_conditioning(audio_state)
             audio_state = audio_tools.unpatchify(audio_state)
         if gpu_manager is not None:
-                gpu_manager.unload_all_blocks_to_cpu()   
+                gpu_manager.unload_all_blocks_to_cpu()
+                # self._transformer is rebuilt from scratch on every call (line 330
+                # above always overwrites it), so the "cached transformer" branch at
+                # line 364 never actually reuses a transformer from a prior call —
+                # it just delays freeing this run's pinned copy. Release it now
+                # instead of waiting for the next call's reassignment to drop the
+                # reference, so its pinned CPU memory can be reclaimed immediately.
+                if self._transformer is not None:
+                    self._transformer.to("meta")
+                    self._transformer = None
+                gc.collect()
+                # Flush the host (pinned) memory cache so that freed pinned pages
+                # are returned to the OS instead of accumulating indefinitely in
+                # PyTorch's CachingHostAllocator.
+                torch.cuda.synchronize()
+                try:
+                    if hasattr(torch._C, "_host_emptyCache"):
+                        torch._C._host_emptyCache()
+                except Exception:
+                    logger.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
         return video_state, audio_state
 
 
