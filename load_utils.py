@@ -38,16 +38,30 @@ from .LTX2.ltx_core.model.audio_vae import encode_audio as vae_encode_audio
 node_cr_path_ = os.path.dirname(os.path.abspath(__file__))
 
 def clear_comfyui_cache():
-    cf_models=mm.loaded_models()
+    # unpatch_model(device_to=cpu) only moves other models off the GPU, it keeps
+    # their weights fully resident in system RAM. LTX2's own GGUF loader needs
+    # tens of GB of free host RAM to load the DiT/text-encoder checkpoints, so
+    # leftover ComfyUI models (e.g. a previous Flux/Krea2/Qwen run) sitting in
+    # CPU RAM can starve it out. unload_all_models() actually detaches/evicts
+    # them so the RAM is reclaimed, not just moved off VRAM.
     try:
-        for pipe in cf_models:
-            pipe.unpatch_model(device_to=torch.device("cpu"))
-            #print(f"Unpatching models.{pipe}")
-    except: pass
+        mm.unload_all_models()
+    except Exception:
+        pass
+    gc.collect()
     mm.soft_empty_cache()
     torch.cuda.empty_cache()
     max_gpu_memory = torch.cuda.max_memory_allocated()
     print(f"After Max GPU memory allocated: {max_gpu_memory / 1000 ** 3:.2f} GB")
+    # Peak (above) only ever grows and doesn't show whether memory is actually
+    # being reclaimed between runs -- log the *current* state so we can see
+    # whether it climbs across successive generations (fragmentation/leak)
+    # or stays flat (one-off/settings-dependent OOM).
+    cur_allocated = torch.cuda.memory_allocated() / 1000 ** 3
+    cur_reserved = torch.cuda.memory_reserved() / 1000 ** 3
+    import psutil
+    rss = psutil.Process().memory_info().rss / 1000 ** 3
+    print(f"Current GPU allocated: {cur_allocated:.2f} GB, reserved: {cur_reserved:.2f} GB, host RSS: {rss:.2f} GB")
 
 def load_model( dit, gguf, lora, distilled_lora, sampling_mode,offload,device): 
     dit_path=folder_paths.get_full_path("diffusion_models", dit) if dit != "none" else None

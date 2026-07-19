@@ -538,7 +538,7 @@ class BlockGPUManager:
     to synchronous copies, so no overlap would actually happen.
     """
 
-    def __init__(self, device="cuda", block_group_size=1,use_gguf=True):
+    def __init__(self, device="cuda", block_group_size=1,use_gguf=True, prefetch_stream=None):
 
         self.device = torch.device(device)
         self.managed_modules = []
@@ -550,7 +550,16 @@ class BlockGPUManager:
         self._group_loaded: list[bool] = []
         self.use_gguf = use_gguf
         self._pinned_groups: list[list[dict[str, torch.Tensor]]] | None = None
-        self._prefetch_stream: torch.cuda.Stream | None = None
+        # Reuse a caller-supplied CUDA stream instead of creating a new
+        # torch.cuda.Stream() per generation: repeatedly creating fresh
+        # streams (one per run) leaks host/pinned memory that never gets
+        # reclaimed by torch._C._host_emptyCache(), even after the stream
+        # object itself is garbage collected. Verified via isolated repro:
+        # reusing one shared stream across many pin+async-copy cycles keeps
+        # RSS flat, while creating a new stream each cycle grows it
+        # unboundedly (~1-1.5GB per cycle).
+        self._owns_prefetch_stream = prefetch_stream is None
+        self._prefetch_stream: torch.cuda.Stream | None = prefetch_stream
         self._group_events: dict[int, torch.cuda.Event] = {}
 
 
@@ -588,7 +597,9 @@ class BlockGPUManager:
         # Skipped for the non-GGUF (deepcopy) path and when CUDA isn't available.
         if self.use_gguf and torch.cuda.is_available():
             print("[LTX2] Async block-swap prefetch: enabled (pinned memory + side CUDA stream)")
-            self._prefetch_stream = torch.cuda.Stream(device=self.device)
+            if self._prefetch_stream is None:
+                self._owns_prefetch_stream = True
+                self._prefetch_stream = torch.cuda.Stream(device=self.device)
             self._pinned_groups = [None] * self._num_groups
             for group_index in range(self._num_groups):
                 start_idx = group_index * self.block_group_size

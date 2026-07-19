@@ -204,6 +204,25 @@ class DiffusionStage:
         self._quantization = quantization
         self._torch_compile = torch_compile
         self._offload = offload
+        # Created once and reused for every generation this stage runs.
+        # BlockGPUManager's block-swap prefetch used to create a fresh
+        # torch.cuda.Stream() per call, which leaks host/pinned memory that
+        # is never reclaimed (repro-confirmed: ~1-1.5GB per generation,
+        # unbounded) -- eventually OOMs the GGUF loader a few videos in.
+        self._prefetch_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        # Cache for the offload+GGUF path (see __call__): pinning the DiT's
+        # ~18GB of CPU weights via tensor.pin_memory() is expensive (~200ms
+        # per generation's worth of pin calls) and, worse, leaks host memory
+        # at the CUDA-driver/Windows level that no Python-side cleanup can
+        # reclaim -- confirmed via isolated repro: torch._C._host_emptyCache()
+        # reports its own byte counters back at 0 after every cycle, yet
+        # process RSS still grows by the full pinned size on every single
+        # pin/unpin cycle, unboundedly. Building+pinning the model once and
+        # reusing it for every generation in this stage's lifetime (instead
+        # of rebuilding from the GGUF file and re-pinning on every call)
+        # avoids the repeated pin/unpin churn entirely.
+        self._cached_transformer = None
+        self._cached_gpu_manager = None
         self._transformer_builder = Builder(
             model_path=checkpoint_path,
             model_class_configurator=LTXModelConfigurator,
@@ -328,11 +347,21 @@ class DiffusionStage:
         """
 
         if self.use_gguf and self._offload:
-            self._transformer = self._gguf_transformer()
-            from ...ltx_core.model.transformer.model import BlockGPUManager         
-            gpu_manager = BlockGPUManager(device="cuda",block_group_size=streaming_prefetch_count,use_gguf=self.use_gguf)
-            gpu_manager.setup_for_inference(self._transformer.velocity_model)
+            if self._cached_transformer is None:
+                from ...ltx_core.model.transformer.model import BlockGPUManager
+                self._cached_transformer = self._gguf_transformer()
+                self._cached_gpu_manager = BlockGPUManager(device="cuda",block_group_size=streaming_prefetch_count,use_gguf=self.use_gguf,prefetch_stream=self._prefetch_stream)
+                self._cached_gpu_manager.setup_for_inference(self._cached_transformer.velocity_model)
+            self._transformer = self._cached_transformer
+            gpu_manager = self._cached_gpu_manager
             infer_device = torch.device("cuda")
+            # unload_all_blocks_to_cpu() (see finally: below) moves the small
+            # fixed submodules (patchify_proj, adaln_single, norm_out, ...)
+            # back to CPU at the end of every run -- fine in the old
+            # build-and-discard design, but now that the transformer/gpu_manager
+            # are cached and reused across calls, nothing else moves them back
+            # onto CUDA for the next run. Do it explicitly here, every call.
+            gpu_manager._initialize_submodule()
         else:
             infer_device = self._device
             gpu_manager=None
@@ -346,74 +375,81 @@ class DiffusionStage:
         if stepper is None:
             stepper = EulerDiffusionStep()
 
-        pixel_shape = VideoPixelShape(batch=1, frames=frames, height=height, width=width, fps=fps)
+        # gpu_manager (when not None) pins the *entire* model's weights in CPU
+        # memory up front and streams groups of layers onto the GPU during the
+        # loop below. Previously, everything from here to the cleanup block at
+        # the end of the function ran with no exception guard: a genuine CUDA
+        # OOM (or any other error) raised mid-loop would skip
+        # unload_all_blocks_to_cpu()/del gpu_manager/cleanup_memory() entirely,
+        # permanently leaking this run's pinned CPU buffers and GPU-resident
+        # block groups for the rest of the process's life -- which then starves
+        # every subsequent, otherwise-unrelated model load in the same session.
+        # The try/finally guarantees that cleanup always runs, on both the
+        # success and the exception path.
+        try:
+            pixel_shape = VideoPixelShape(batch=1, frames=frames, height=height, width=width, fps=fps)
 
-        video_state: LatentState | None = None
-        video_tools: LatentTools | None = None
-        if video is not None:
-            v_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
-            video_tools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), v_shape, fps)
-            video_state = _build_state(video, video_tools, noiser, self._dtype, infer_device)
+            video_state: LatentState | None = None
+            video_tools: LatentTools | None = None
+            if video is not None:
+                v_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
+                video_tools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), v_shape, fps)
+                video_state = _build_state(video, video_tools, noiser, self._dtype, infer_device)
 
-        audio_state: LatentState | None = None
-        audio_tools: LatentTools | None = None
-        if audio is not None:
-            a_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
-            audio_tools = AudioLatentTools(AudioPatchifier(patch_size=1), a_shape)
-            audio_state = _build_state(audio, audio_tools, noiser, self._dtype, infer_device)
-       
-        if self._transformer is not None:
-            print("Using cached transformer")
-            video_state, audio_state = loop(
-                sigmas=sigmas,
-                video_state=video_state,
-                audio_state=audio_state,
-                stepper=stepper,
-                transformer=self._transformer,
-                denoiser=denoiser,
-                gpu_manager=gpu_manager,
-            )
-        else:
-            with self._transformer_ctx(streaming_prefetch_count, video_tools=video_tools) as base_transformer:
-                transformer = BatchSplitAdapter(base_transformer, max_batch_size=max_batch_size)
+            audio_state: LatentState | None = None
+            audio_tools: LatentTools | None = None
+            if audio is not None:
+                a_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
+                audio_tools = AudioLatentTools(AudioPatchifier(patch_size=1), a_shape)
+                audio_state = _build_state(audio, audio_tools, noiser, self._dtype, infer_device)
+
+            if self._transformer is not None:
+                print("Using cached transformer")
                 video_state, audio_state = loop(
                     sigmas=sigmas,
                     video_state=video_state,
                     audio_state=audio_state,
                     stepper=stepper,
-                    transformer=transformer,
+                    transformer=self._transformer,
                     denoiser=denoiser,
-                )    
-        
-        # Post-process: clear conditionings and unpatchify
-        if video_state is not None and video_tools is not None:
-            video_state = video_tools.clear_conditioning(video_state)
-            video_state = video_tools.unpatchify(video_state)
+                    gpu_manager=gpu_manager,
+                )
+            else:
+                with self._transformer_ctx(streaming_prefetch_count, video_tools=video_tools) as base_transformer:
+                    transformer = BatchSplitAdapter(base_transformer, max_batch_size=max_batch_size)
+                    video_state, audio_state = loop(
+                        sigmas=sigmas,
+                        video_state=video_state,
+                        audio_state=audio_state,
+                        stepper=stepper,
+                        transformer=transformer,
+                        denoiser=denoiser,
+                    )
 
-        if audio_state is not None and audio_tools is not None:
-            audio_state = audio_tools.clear_conditioning(audio_state)
-            audio_state = audio_tools.unpatchify(audio_state)
-        if gpu_manager is not None:
-                gpu_manager.unload_all_blocks_to_cpu()
-                # self._transformer is rebuilt from scratch on every call (line 330
-                # above always overwrites it), so the "cached transformer" branch at
-                # line 364 never actually reuses a transformer from a prior call —
-                # it just delays freeing this run's pinned copy. Release it now
-                # instead of waiting for the next call's reassignment to drop the
-                # reference, so its pinned CPU memory can be reclaimed immediately.
-                if self._transformer is not None:
-                    self._transformer.to("meta")
-                    self._transformer = None
-                gc.collect()
-                # Flush the host (pinned) memory cache so that freed pinned pages
-                # are returned to the OS instead of accumulating indefinitely in
-                # PyTorch's CachingHostAllocator.
-                torch.cuda.synchronize()
+            # Post-process: clear conditionings and unpatchify
+            if video_state is not None and video_tools is not None:
+                video_state = video_tools.clear_conditioning(video_state)
+                video_state = video_tools.unpatchify(video_state)
+
+            if audio_state is not None and audio_tools is not None:
+                audio_state = audio_tools.clear_conditioning(audio_state)
+                audio_state = audio_tools.unpatchify(audio_state)
+        finally:
+            if gpu_manager is not None:
                 try:
-                    if hasattr(torch._C, "_host_emptyCache"):
-                        torch._C._host_emptyCache()
+                    # gpu_manager/self._transformer are now self._cached_gpu_manager/
+                    # self._cached_transformer (see __call__ above): built once and
+                    # reused for every generation this stage runs, instead of being
+                    # rebuilt from the GGUF file and re-pinned via pin_memory() on
+                    # every call. Only move this run's GPU-resident block groups back
+                    # to their pinned CPU home -- do NOT tear down the transformer or
+                    # drop/re-pin the cache itself, that's what caused the leak.
+                    gpu_manager.unload_all_blocks_to_cpu()
+                    torch.cuda.synchronize()
                 except Exception:
-                    logger.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
+                    # Never let a cleanup failure mask the original exception
+                    # (if any) that's propagating out of the try block above.
+                    logger.warning("gpu_manager cleanup failed; ignoring.", exc_info=True)
         return video_state, audio_state
 
 
