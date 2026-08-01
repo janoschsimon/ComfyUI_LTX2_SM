@@ -26,15 +26,6 @@ from diffusers.quantizers.gguf.utils import dequantize_gguf_tensor
 import comfy.ops
 logger: logging.Logger = logging.getLogger(__name__)
 
-try:
-    from comfy_kitchen.tensor import QuantizedTensor
-except ImportError:
-    QuantizedTensor = None
-
-
-def _is_quantized(tensor: torch.Tensor) -> bool:
-    return QuantizedTensor is not None and isinstance(tensor, QuantizedTensor)
-
 # Prefix community LTX2 checkpoints (e.g. int8_tensorwise/convrot quantized
 # finetunes such as "eros10") store in front of every DiT key on disk. Same
 # prefix comfy's own core loader strips for the same reason (LTXV_MODEL_COMFY_RENAMING_MAP
@@ -83,18 +74,8 @@ def _apply_comfy_quantization(
     per-layer `.comfy_quant` sidecar key its `_load_from_state_dict` expects to find
     (mirrors comfy.utils.convert_old_quants). Every other key in *sd* is untouched
     and still loads through the normal meta_model.load_state_dict(assign=True) path.
-
-    Weights are kept on CPU (not *device*) on purpose: MixedPrecisionOps.Linear's
-    own forward() already calls comfy.ops.cast_bias_weight(..., offloadable=True),
-    which casts a CPU-resident weight to the compute device just for the duration
-    of that one forward call and releases it again -- comfy's own solution for
-    models bigger than VRAM. No reason to reimplement that with a bespoke
-    CPU-pin/stream wrapper (see layer_streaming.py's _is_quantized skip) or to
-    force the whole quantized DiT permanently onto the GPU, which for a DiT this
-    size doesn't fit anyway.
     """
     ops_module = comfy.ops.mixed_precision_ops(compute_dtype=compute_dtype)
-    cpu = torch.device("cpu")
     layers = quant_metadata.get("layers", {})
     applied = 0
     for raw_key, layer_conf in layers.items():
@@ -114,7 +95,7 @@ def _apply_comfy_quantization(
             old_linear.in_features,
             old_linear.out_features,
             bias=old_linear.bias is not None,
-            device=cpu,
+            device=device,
             dtype=compute_dtype,
         )
         setattr(parent, attr, new_linear)
@@ -122,7 +103,7 @@ def _apply_comfy_quantization(
         applied += 1
     if applied:
         fmt = next(iter(layers.values())).get("format") if layers else "?"
-        logger.info("Applied comfy quantization (%s) to %d layers, offloaded to CPU for on-demand GPU casting", fmt, applied)
+        logger.info("Applied comfy quantization (%s) to %d layers", fmt, applied)
     return sd
 
 
@@ -228,20 +209,8 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         if uninitialized_params or uninitialized_buffers:
             logger.warning(f"Uninitialized parameters or buffers: {uninitialized_params + uninitialized_buffers}")
             return meta_model
-        # Quantized (comfy.ops QuantizedTensor) params are deliberately left on CPU --
-        # see _apply_comfy_quantization -- so a blanket meta_model.to(device) would both
-        # move them back onto the GPU (defeating the point for a DiT bigger than VRAM)
-        # and risk mangling them via QuantizedTensor's dequant __torch_dispatch__ fallback.
-        has_quantized = any(_is_quantized(p.data) for p in meta_model.parameters())
-        if not has_quantized:
-            return meta_model.to(device)
-        for p in meta_model.parameters():
-            if not _is_quantized(p.data):
-                p.data = p.data.to(device)
-        for b in meta_model.buffers():
-            if not _is_quantized(b.data):
-                b.data = b.data.to(device)
-        return meta_model
+        retval = meta_model.to(device)
+        return retval
 
     def build(
         self,
