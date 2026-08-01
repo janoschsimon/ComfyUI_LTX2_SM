@@ -1,11 +1,9 @@
-import json
 import logging
 from dataclasses import dataclass, field, replace
 from typing import Generic
 from contextlib import nullcontext
 from accelerate import init_empty_weights
 from diffusers.utils import is_accelerate_available
-import safetensors
 import torch
 import gc
 from .fuse_loras import apply_loras
@@ -23,88 +21,7 @@ from .sd_ops import SDOps
 from .sft_loader import SafetensorsModelStateDictLoader
 from ..model.model_protocol import ModelConfigurator, ModelType
 from diffusers.quantizers.gguf.utils import dequantize_gguf_tensor
-import comfy.ops
 logger: logging.Logger = logging.getLogger(__name__)
-
-# Prefix community LTX2 checkpoints (e.g. int8_tensorwise/convrot quantized
-# finetunes such as "eros10") store in front of every DiT key on disk. Same
-# prefix comfy's own core loader strips for the same reason (LTXV_MODEL_COMFY_RENAMING_MAP
-# in model_configurator.py does the identical strip for the plain weight keys).
-_QUANTIZED_MODEL_KEY_PREFIX = "model.diffusion_model."
-
-
-def _read_quantization_metadata(paths: list[str]) -> dict | None:
-    """Read the ComfyUI-native `_quantization_metadata` safetensors header (per-layer
-    int8_tensorwise/fp8/convrot_w4a4 format + scale info), if the checkpoint has one.
-    This is the exact same metadata ComfyUI's core UNETLoader reads to build quantized
-    layers via comfy.ops.mixed_precision_ops -- reusing it here instead of reimplementing
-    dequantization means int8-quantized DiTs (e.g. community "eros10" checkpoints) load
-    the same way they already do through the normal ComfyUI loader.
-    """
-    for path in paths:
-        with safetensors.safe_open(path, framework="pt") as f:
-            meta = f.metadata()
-        if meta and "_quantization_metadata" in meta:
-            return json.loads(meta["_quantization_metadata"])
-    return None
-
-
-def _resolve_submodule(model: torch.nn.Module, dotted_name: str) -> tuple[torch.nn.Module, str] | None:
-    parent = model
-    parts = dotted_name.split(".")
-    for part in parts[:-1]:
-        if not hasattr(parent, part):
-            return None
-        parent = getattr(parent, part)
-    if not hasattr(parent, parts[-1]):
-        return None
-    return parent, parts[-1]
-
-
-def _apply_comfy_quantization(
-    meta_model: torch.nn.Module,
-    sd: dict,
-    quant_metadata: dict,
-    device: torch.device,
-    compute_dtype: torch.dtype,
-) -> dict:
-    """Swap the plain nn.Linear layers named in *quant_metadata* for
-    comfy.ops.mixed_precision_ops Linear layers -- the same class ComfyUI's core
-    loader uses for int8_tensorwise/fp8/convrot_w4a4 checkpoints -- and inject the
-    per-layer `.comfy_quant` sidecar key its `_load_from_state_dict` expects to find
-    (mirrors comfy.utils.convert_old_quants). Every other key in *sd* is untouched
-    and still loads through the normal meta_model.load_state_dict(assign=True) path.
-    """
-    ops_module = comfy.ops.mixed_precision_ops(compute_dtype=compute_dtype)
-    layers = quant_metadata.get("layers", {})
-    applied = 0
-    for raw_key, layer_conf in layers.items():
-        key = raw_key
-        if key.startswith(_QUANTIZED_MODEL_KEY_PREFIX):
-            key = key[len(_QUANTIZED_MODEL_KEY_PREFIX):]
-        resolved = _resolve_submodule(meta_model, key)
-        if resolved is None:
-            logger.warning("Quantized layer %s not found in model, skipping", key)
-            continue
-        parent, attr = resolved
-        old_linear = getattr(parent, attr)
-        if not isinstance(old_linear, torch.nn.Linear):
-            logger.warning("Quantized layer %s is not a Linear, skipping", key)
-            continue
-        new_linear = ops_module.Linear(
-            old_linear.in_features,
-            old_linear.out_features,
-            bias=old_linear.bias is not None,
-            device=device,
-            dtype=compute_dtype,
-        )
-        setattr(parent, attr, new_linear)
-        sd[f"{key}.comfy_quant"] = torch.tensor(list(json.dumps(layer_conf).encode("utf-8")), dtype=torch.uint8)
-        applied += 1
-    if applied:
-        fmt = next(iter(layers.values())).get("format") if layers else "?"
-        logger.info("Applied comfy quantization (%s) to %d layers", fmt, applied)
-    return sd
 
 
 @dataclass(frozen=True)
@@ -331,17 +248,8 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
                 sd = model_state_dict.sd
                 del model_state_dict
                 gc.collect()
-                quantized_prefixes = ()
-                if self.load_model == "dit":
-                    quant_metadata = _read_quantization_metadata(model_paths)
-                    if quant_metadata is not None:
-                        sd = _apply_comfy_quantization(meta_model, sd, quant_metadata, device, dtype or torch.bfloat16)
-                        quantized_prefixes = tuple(k[: -len("comfy_quant")] for k in sd if k.endswith(".comfy_quant"))
                 if dtype is not None  and not use_gguf :
-                    sd = {
-                        key: (value.to(dtype=dtype) if not key.startswith(quantized_prefixes) else value)
-                        for key, value in sd.items()
-                    }
+                    sd = {key: value.to(dtype=dtype) for key, value in sd.items()}
                 meta_model.load_state_dict(sd, strict=False, assign=True)
                 del sd
                 gc.collect()
