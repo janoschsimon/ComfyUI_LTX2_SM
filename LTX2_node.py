@@ -44,14 +44,8 @@ class LTX2_SM_Model(io.ComfyNode):
     @classmethod
     def execute(cls,dit,gguf,distilled_lora,lora,sampling_mode,offload) -> io.NodeOutput:
         clear_comfyui_cache()
-        # current_device must stay the compute device (cuda) regardless of
-        # offload -- offload's CPU-build+stream logic is already driven
-        # separately by the offload flag inside DiffusionStage (blocks.py).
-        # Forcing this to cpu here broke the non-GGUF offload path: infer_device
-        # and target_device fell back to self._device=cpu while merge_pipeline's
-        # noise generator was still forced to cuda whenever offload=True,
-        # causing "Expected a 'cpu' device type for generator but found 'cuda'".
-        model= load_model(dit, gguf, lora, distilled_lora,sampling_mode,offload,device)
+        current_device = device if not  offload else torch.device("cpu")
+        model= load_model(dit, gguf, lora, distilled_lora,sampling_mode,offload,current_device)
         return io.NodeOutput(model)
 
 class LTX2_SM_VAE(io.ComfyNode):
