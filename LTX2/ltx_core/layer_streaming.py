@@ -32,6 +32,21 @@ from torch import nn
 
 logger = logging.getLogger(__name__)
 
+try:
+    from comfy_kitchen.tensor import QuantizedTensor
+except ImportError:
+    QuantizedTensor = None
+
+
+def _is_quantized(tensor: torch.Tensor) -> bool:
+    """QuantizedTensor (comfy_kitchen) params are permanently GPU-resident from
+    construction (see single_gpu_model_builder._apply_comfy_quantization) and much
+    smaller than their unquantized counterparts, so they don't need CPU-pin/stream
+    treatment. Routing them through pin_memory()/.to() here dequantizes them via
+    QuantizedTensor.__torch_dispatch__'s fallback path, silently losing the CUDA
+    residency the quantized-layer machinery expects -- so they must be skipped."""
+    return QuantizedTensor is not None and isinstance(tensor, QuantizedTensor)
+
 
 def _resolve_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:
     """Resolve a dotted attribute path like ``'model.language_model.layers'``."""
@@ -60,6 +75,8 @@ class _LayerStore:
         for layer in layers:
             pinned: dict[str, torch.Tensor] = {}
             for name, tensor in itertools.chain(layer.named_parameters(), layer.named_buffers()):
+                if _is_quantized(tensor.data):
+                    continue
                 pinned_tensor = tensor.data.pin_memory()
                 tensor.data = pinned_tensor
                 pinned[name] = pinned_tensor
@@ -79,6 +96,8 @@ class _LayerStore:
             return
         pinned = self._pinned[idx]
         for name, param in itertools.chain(layer.named_parameters(), layer.named_buffers()):
+            if name not in pinned:
+                continue
             param.data = pinned[name].to(self.target_device, non_blocking=non_blocking)
         self._on_gpu.add(idx)
 
@@ -89,6 +108,8 @@ class _LayerStore:
             return
         pinned = self._pinned[idx]
         for name, param in itertools.chain(layer.named_parameters(), layer.named_buffers()):
+            if name not in pinned:
+                continue
             param.data = pinned[name]
         self._on_gpu.discard(idx)
 
@@ -327,6 +348,8 @@ class LayerStreamingWrapper(nn.Module):
             # that reads them hasn't finished yet.
             compute_stream = torch.cuda.current_stream(self._target_device)
             for param in itertools.chain(module.parameters(), module.buffers()):
+                if _is_quantized(param.data):
+                    continue
                 param.data.record_stream(compute_stream)
 
             # Kick off prefetch for upcoming layers (wraps around for next pass).
